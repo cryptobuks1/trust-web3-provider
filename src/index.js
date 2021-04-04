@@ -1,23 +1,31 @@
+// Copyright © 2017-2020 Trust Wallet.
+//
+// This file is part of Trust. The full Trust copyright notice, including
+// terms governing use, modification, and redistribution, is contained in the
+// file LICENSE at the root of the source code distribution tree.
+
 "use strict";
 
 import Web3 from "web3";
-import FilterMgr from "./filter";
 import RPCServer from "./rpc";
+import ProviderRpcError from "./error";
 import Utils from "./utils";
 import IdMapping from "./id_mapping";
+import { EventEmitter } from "events";
+import isUtf8 from "isutf8";
 
-class TrustWeb3Provider {
+class TrustWeb3Provider extends EventEmitter {
   constructor(config) {
+    super();
     this.setConfig(config);
 
     this.idMapping = new IdMapping();
-
-    this.callbacks = new Map;
+    this.callbacks = new Map();
+    this.wrapResults = new Map();
     this.isTrust = true;
-  }
+    this.isDebug = !!config.isDebug;
 
-  isConnected() {
-    return true;
+    this.emitConnect(config.chainId);
   }
 
   setAddress(address) {
@@ -30,27 +38,41 @@ class TrustWeb3Provider {
 
     this.chainId = config.chainId;
     this.rpc = new RPCServer(config.rpcUrl);
-    this.filterMgr = new FilterMgr(this.rpc);
+    this.isDebug = !!config.isDebug;
   }
 
+  request(payload) {
+    // this points to window in methods like web3.eth.getAccounts()
+    var that = this;
+    if (!(this instanceof TrustWeb3Provider)) {
+      that = window.ethereum;
+    }
+    return that._request(payload, false);
+  }
+
+  /**
+   * @deprecated Listen to "connect" event instead.
+   */
+  isConnected() {
+    return true;
+  }
+
+  /**
+   * @deprecated Use request({method: "eth_requestAccounts"}) instead.
+   */
   enable() {
-    // this may be undefined somehow
-    var that = this || window.ethereum;
-    return that._sendAsync({
-      method: "eth_requestAccounts",
-      params: []
-    })
-    .then(result => {
-      return result.result;
-    });
+    console.log(
+      'enable() is deprecated, please use window.ethereum.request({method: "eth_requestAccounts"}) instead.'
+    );
+    return this.request({ method: "eth_requestAccounts", params: [] });
   }
 
+  /**
+   * @deprecated Use request() method instead.
+   */
   send(payload) {
-    let response = {
-      jsonrpc: "2.0",
-      id: payload.id
-    };
-    switch(payload.method) {
+    let response = { jsonrpc: "2.0", id: payload.id };
+    switch (payload.method) {
       case "eth_accounts":
         response.result = this.eth_accounts();
         break;
@@ -63,34 +85,47 @@ class TrustWeb3Provider {
       case "eth_chainId":
         response.result = this.eth_chainId();
         break;
-      case "eth_uninstallFilter":
-        this.sendAsync(payload, (error) => {
-          if (error) {
-            console.log(`<== uninstallFilter ${error}`);
-          }
-        });
-        response.result = true;
-        break;
       default:
-        throw new Error(`Trust does not support calling ${payload.method} synchronously without a callback. Please provide a callback parameter to call ${payload.method} asynchronously.`);
+        throw new ProviderRpcError(
+          4200,
+          `Trust does not support calling ${payload.method} synchronously without a callback. Please provide a callback parameter to call ${payload.method} asynchronously.`
+        );
     }
     return response;
   }
 
+  /**
+   * @deprecated Use request() method instead.
+   */
   sendAsync(payload, callback) {
+    console.log(
+      "sendAsync(data, callback) is deprecated, please use window.ethereum.request(data) instead."
+    );
+    // this points to window in methods like web3.eth.getAccounts()
+    var that = this;
+    if (!(this instanceof TrustWeb3Provider)) {
+      that = window.ethereum;
+    }
     if (Array.isArray(payload)) {
-      Promise.all(payload.map(this._sendAsync.bind(this)))
-      .then(data => callback(null, data))
-      .catch(error => callback(error, null));
+      Promise.all(payload.map(that._request.bind(that)))
+        .then((data) => callback(null, data))
+        .catch((error) => callback(error, null));
     } else {
-      this._sendAsync(payload)
-      .then(data => callback(null, data))
-      .catch(error => callback(error, null));
+      that
+        ._request(payload)
+        .then((data) => callback(null, data))
+        .catch((error) => callback(error, null));
     }
   }
 
-  _sendAsync(payload) {
+  /**
+   * @private Internal rpc handler
+   */
+  _request(payload, wrapResult = true) {
     this.idMapping.tryIntifyId(payload);
+    if (this.isDebug) {
+      console.log(`==> _request payload ${JSON.stringify(payload)}`);
+    }
     return new Promise((resolve, reject) => {
       if (!payload.id) {
         payload.id = Utils.genId();
@@ -102,8 +137,9 @@ class TrustWeb3Provider {
           resolve(data);
         }
       });
+      this.wrapResults.set(payload.id, wrapResult);
 
-      switch(payload.method) {
+      switch (payload.method) {
         case "eth_accounts":
           return this.sendResponse(payload.id, this.eth_accounts());
         case "eth_coinbase":
@@ -125,23 +161,38 @@ class TrustWeb3Provider {
           return this.eth_sendTransaction(payload);
         case "eth_requestAccounts":
           return this.eth_requestAccounts(payload);
+        case "wallet_watchAsset":
+          return this.wallet_watchAsset(payload);
+        case "wallet_addEthereumChain":
+          return this.wallet_addEthereumChain(payload);
         case "eth_newFilter":
-          return this.eth_newFilter(payload);
         case "eth_newBlockFilter":
-          return this.eth_newBlockFilter(payload);
         case "eth_newPendingTransactionFilter":
-          return this.eth_newPendingTransactionFilter(payload);
         case "eth_uninstallFilter":
-          return this.eth_uninstallFilter(payload);
-        case "eth_getFilterChanges":
-          return this.eth_getFilterChanges(payload);
-        case "eth_getFilterLogs":
-          return this.eth_getFilterLogs(payload);
+        case "eth_subscribe":
+          throw new ProviderRpcError(
+            4200,
+            `Trust does not support calling ${payload.method}. Please use your own solution`
+          );
         default:
+          // call upstream rpc
           this.callbacks.delete(payload.id);
-          return this.rpc.call(payload).then(resolve).catch(reject);
+          this.wrapResults.delete(payload.id);
+          return this.rpc
+            .call(payload)
+            .then((response) => {
+              if (this.isDebug) {
+                console.log(`<== rpc response ${JSON.stringify(response)}`);
+              }
+              wrapResult ? resolve(response) : resolve(response.result);
+            })
+            .catch(reject);
       }
     });
+  }
+
+  emitConnect(chainId) {
+    this.emit("connect", { chainId: chainId });
   }
 
   eth_accounts() {
@@ -161,19 +212,38 @@ class TrustWeb3Provider {
   }
 
   eth_sign(payload) {
-    this.postMessage("signMessage", payload.id, {data: payload.params[1]});
+    const buffer = Utils.messageToBuffer(payload.params[1]);
+    const hex = Utils.bufferToHex(buffer);
+    if (isUtf8(buffer)) {
+      this.postMessage("signPersonalMessage", payload.id, { data: hex });
+    } else {
+      this.postMessage("signMessage", payload.id, { data: hex });
+    }
   }
 
   personal_sign(payload) {
-    this.postMessage("signPersonalMessage", payload.id, {data: payload.params[0]});
+    const message = payload.params[0];
+    const buffer = Utils.messageToBuffer(message);
+    if (buffer.length === 0) {
+      // hex it
+      const hex = Utils.bufferToHex(message);
+      this.postMessage("signPersonalMessage", payload.id, { data: hex });
+    } else {
+      this.postMessage("signPersonalMessage", payload.id, { data: message });
+    }
   }
 
   personal_ecRecover(payload) {
-    this.postMessage("ecRecover", payload.id, {signature: payload.params[1], message: payload.params[0]});
+    this.postMessage("ecRecover", payload.id, {
+      signature: payload.params[1],
+      message: payload.params[0],
+    });
   }
 
   eth_signTypedData(payload) {
-    this.postMessage("signTypedMessage", payload.id, {data: payload.params[1]});
+    this.postMessage("signTypedMessage", payload.id, {
+      data: payload.params[1],
+    });
   }
 
   eth_sendTransaction(payload) {
@@ -184,70 +254,84 @@ class TrustWeb3Provider {
     this.postMessage("requestAccounts", payload.id, {});
   }
 
-  eth_newFilter(payload) {
-    this.filterMgr.newFilter(payload)
-    .then(filterId => this.sendResponse(payload.id, filterId))
-    .catch(error => this.sendError(payload.id, error));
+  wallet_watchAsset(payload) {
+    let options = payload.params.options;
+    this.postMessage("watchAsset", payload.id, {
+      type: payload.type,
+      contract: options.address,
+      symbol: options.symbol,
+      decimals: options.decimals || 0,
+    });
   }
 
-  eth_newBlockFilter(payload) {
-    this.filterMgr.newBlockFilter()
-    .then(filterId => this.sendResponse(payload.id, filterId))
-    .catch(error => this.sendError(payload.id, error));
+  wallet_addEthereumChain(payload) {
+    this.postMessage("addEthereumChain", payload.id, payload.params[0]);
   }
 
-  eth_newPendingTransactionFilter(payload) {
-    this.filterMgr.newPendingTransactionFilter()
-    .then(filterId => this.sendResponse(payload.id, filterId))
-    .catch(error => this.sendError(payload.id, error));
-  }
-
-  eth_uninstallFilter(payload) {
-    this.filterMgr.uninstallFilter(payload.params[0])
-    .then(filterId => this.sendResponse(payload.id, filterId))
-    .catch(error => this.sendError(payload.id, error));
-  }
-
-  eth_getFilterChanges(payload) {
-    this.filterMgr.getFilterChanges(payload.params[0])
-    .then(data => this.sendResponse(payload.id, data))
-    .catch(error => this.sendError(payload.id, error));
-  }
-
-  eth_getFilterLogs(payload) {
-    this.filterMgr.getFilterLogs(payload.params[0])
-    .then(data => this.sendResponse(payload.id, data))
-    .catch(error => this.sendError(payload.id, error));
-  }
-
+  /**
+   * @private Internal js -> native message handler
+   */
   postMessage(handler, id, data) {
     if (this.ready || handler === "requestAccounts") {
-      window.webkit.messageHandlers[handler].postMessage({
-        "name": handler,
-        "object": data,
-        "id": id
-      });
+      let object = {
+        id: id,
+        name: handler,
+        object: data,
+      };
+      if (window.trustwallet.postMessage) {
+        window.trustwallet.postMessage(object);
+      } else {
+        // old clients
+        window.webkit.messageHandlers[handler].postMessage(object);
+      }
     } else {
       // don't forget to verify in the app
-      this.sendError(id, new Error("provider is not ready"));
+      this.sendError(id, new ProviderRpcError(4100, "provider is not ready"));
     }
   }
 
+  /**
+   * @private Internal native result -> js
+   */
   sendResponse(id, result) {
     let originId = this.idMapping.tryPopId(id) || id;
     let callback = this.callbacks.get(id);
-    let data = {jsonrpc: "2.0", id: originId};
+    let wrapResult = this.wrapResults.get(id);
+    let data = { jsonrpc: "2.0", id: originId };
     if (typeof result === "object" && result.jsonrpc && result.result) {
       data.result = result.result;
     } else {
       data.result = result;
     }
+    if (this.isDebug) {
+      console.log(
+        `<== sendResponse id: ${id}, result: ${JSON.stringify(
+          result
+        )}, data: ${JSON.stringify(data)}`
+      );
+    }
     if (callback) {
-      callback(null, data);
+      wrapResult ? callback(null, data) : callback(null, result);
       this.callbacks.delete(id);
+    } else {
+      console.log(`callback id: ${id} not found`);
+      // check if it's iframe callback
+      for (var i = 0; i < window.frames.length; i++) {
+        const frame = window.frames[i];
+        try {
+          if (frame.ethereum.callbacks.has(id)) {
+            frame.ethereum.sendResponse(id, result);
+          }
+        } catch (error) {
+          console.log(`send response to frame error: ${error}`);
+        }
+      }
     }
   }
 
+  /**
+   * @private Internal native error -> js
+   */
   sendError(id, error) {
     console.log(`<== ${id} sendError ${error}`);
     let callback = this.callbacks.get(id);
@@ -258,5 +342,8 @@ class TrustWeb3Provider {
   }
 }
 
-window.Trust = TrustWeb3Provider;
-window.Web3 = Web3;
+window.trustwallet = {
+  Provider: TrustWeb3Provider,
+  Web3: Web3,
+  postMessage: null
+};

@@ -1,4 +1,12 @@
+// Copyright © 2017-2020 Trust Wallet.
+//
+// This file is part of Trust. The full Trust copyright notice, including
+// terms governing use, modification, and redistribution, is contained in the
+// file LICENSE at the root of the source code distribution tree.
+
 "use strict";
+
+import { Buffer } from "buffer";
 
 class Utils {
   static genId() {
@@ -29,6 +37,21 @@ class Utils {
     }
     let hexString = int.toString(16);
     return "0x" + hexString;
+  }
+
+  // message: Bytes | string
+  static messageToBuffer(message) {
+    var buffer;
+    if ((typeof (message) === "string")) {
+      buffer = Buffer.from(message.replace("0x", ""), "hex");
+    } else {
+      buffer = Buffer.from(message);
+    }
+    return buffer;
+  }
+
+  static bufferToHex(buf) {
+    return "0x" + Buffer.from(buf).toString("hex");
   }
 }
 
